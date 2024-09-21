@@ -1,0 +1,35 @@
+fdt addr 0x45200000
+fdt resize 1024
+fdt set /chosen \#address-cells <0x2>
+fdt set /chosen \#size-cells <0x2>
+fdt set /chosen xen,xen-bootargs "bootscrub=0 vwfi=native sched=null"
+fdt mknod /chosen domU0
+fdt set /chosen/domU0 compatible "xen,domain"
+fdt set /chosen/domU0 \#address-cells <0x2>
+fdt set /chosen/domU0 \#size-cells <0x2>
+fdt set /chosen/domU0 memory <0 524288>
+fdt set /chosen/domU0 cpus <1>
+fdt set /chosen/domU0 vpl011 <0x1>
+fdt mknod /chosen/domU0 module0x40400000
+fdt set /chosen/domU0/module0x40400000 compatible  "multiboot,kernel" "multiboot,module"
+fdt set /chosen/domU0/module0x40400000 reg <0x0 0x40400000 0x0 0x15A0000 >
+fdt set /chosen/domU0/module0x40400000 bootargs "rw root=/dev/ram rdinit=/sbin/init earlycon console=ttyAMA0"
+fdt mknod /chosen/domU0 module0x41A00000
+fdt set /chosen/domU0/module0x41A00000 compatible  "multiboot,ramdisk" "multiboot,module"
+fdt set /chosen/domU0/module0x41A00000 reg <0x0 0x41A00000 0x0 0xEEDFD3 >
+fdt mknod /chosen domU1
+fdt set /chosen/domU1 compatible "xen,domain"
+fdt set /chosen/domU1 \#address-cells <0x2>
+fdt set /chosen/domU1 \#size-cells <0x2>
+fdt set /chosen/domU1 memory <0 1048576>
+fdt set /chosen/domU1 cpus <1>
+fdt set /chosen/domU1 vpl011 <0x1>
+fdt mknod /chosen/domU1 module0x42A00000
+fdt set /chosen/domU1/module0x42A00000 compatible  "multiboot,kernel" "multiboot,module"
+fdt set /chosen/domU1/module0x42A00000 reg <0x0 0x42A00000 0x0 0x15A0000 >
+fdt set /chosen/domU1/module0x42A00000 bootargs "console=ttyAMA0"
+fdt mknod /chosen/domU1 module0x44000000
+fdt set /chosen/domU1/module0x44000000 compatible  "multiboot,ramdisk" "multiboot,module"
+fdt set /chosen/domU1/module0x44000000 reg <0x0 0x44000000 0x0 0xEEDFD3 >
+setenv fdt_high 0xffffffffffffffff
+booti 0x45000000 - 0x45200000

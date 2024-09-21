@@ -1,0 +1,1402 @@
+#!/bin/bash
+
+offset=$((2*1024*1024))
+filesize=0
+prog_req=(mkimage file fdtput mktemp awk od)
+
+function cleanup_and_return_err()
+{
+    rm -f $UBOOT_SOURCE $UBOOT_SCRIPT
+    remove_tmp_files
+    exit 1
+}
+
+function dt_mknode()
+{
+    local path=$1
+    local addr=$2
+
+    if test "$UBOOT_SOURCE" && test ! "$FIT"
+    then
+        echo "fdt mknod $path $addr" >> $UBOOT_SOURCE
+    fi
+}
+
+function split_value()
+{
+    local value=$1
+    printf "0x%X " "$(($value >> 32))"
+    printf "0x%X " "$(($value & 0xFFFFFFFF))"
+}
+
+function split_addr_size()
+{
+    local addr=$1
+    local size=$2
+
+    split_value $addr
+    split_value $size
+}
+
+# data_type is either
+#   int
+#   hex
+#   str
+#   str_a
+#   bool
+function dt_set()
+{
+    local path=$1
+    local var=$2
+    local data_type=$3
+    local data=$4
+
+
+    if test "$UBOOT_SOURCE" && test ! "$FIT"
+    then
+        var=${var/\#/\\#}
+        if test $data_type = "hex" || test $data_type = "int"
+        then
+            echo "fdt set $path $var <$data>" >> $UBOOT_SOURCE
+        elif test $data_type = "str_a"
+        then
+            array=""
+            for element in $data
+            do
+                array+=" \"$element\""
+            done
+            echo "fdt set $path $var $array" >> $UBOOT_SOURCE
+        elif test $data_type = "bool"
+        then
+            if test "$data" -eq 1
+            then
+                echo "fdt set $path $var" >> $UBOOT_SOURCE
+            fi
+        else
+            echo "fdt set $path $var \"$data\"" >> $UBOOT_SOURCE
+        fi
+    fi
+
+    if test $FDTEDIT
+    then
+        if test $data_type = "hex"
+        then
+            fdtput $FDTEDIT -p -t x $path $var $data
+        elif test $data_type = "int"
+        then
+            fdtput $FDTEDIT -p -t i $path $var $data
+        elif test $data_type = "str_a"
+        then
+            fdtput $FDTEDIT -p -t s $path $var $data
+        elif test $data_type = "bool"
+        then
+            if test "$data" -eq 1
+            then
+                fdtput $FDTEDIT -p $path $var
+            fi
+        else
+            fdtput $FDTEDIT -p -t s $path $var "$data"
+        fi
+    fi
+}
+
+function add_device_tree_kernel()
+{
+    local path=$1
+    local addr=$2
+    local size=$3
+    local bootargs=$4
+
+    dt_mknode "$path" "module$addr"
+    dt_set "$path/module$addr" "compatible" "str_a" "multiboot,kernel multiboot,module"
+    dt_set "$path/module$addr" "reg" "hex"  "$(split_addr_size $addr $size)"
+    dt_set "$path/module$addr" "bootargs" "str" "$bootargs"
+}
+
+
+function add_device_tree_ramdisk()
+{
+    local path=$1
+    local addr=$2
+    local size=$3
+
+    dt_mknode "$path"  "module$addr"
+    dt_set "$path/module$addr" "compatible" "str_a" "multiboot,ramdisk multiboot,module"
+    dt_set "$path/module$addr" "reg" "hex"  "$(split_addr_size $addr $size)"
+}
+
+
+function add_device_tree_passthrough()
+{
+    local path=$1
+    local addr=$2
+    local size=$3
+
+    dt_mknode "$path"  "module$addr"
+    dt_set "$path/module$addr" "compatible" "str_a" "multiboot,device-tree multiboot,module"
+    dt_set "$path/module$addr" "reg" "hex"  "$(split_addr_size $addr $size)"
+}
+
+function add_device_tree_mem()
+{
+    local path=$1
+    local memory=$2
+    local regions=$3
+    local static_mem=0
+
+    # When the DOMU is configured with static allocation,
+    # the size of DOMU's memory must match the size of DOMU's static memory.
+    if test "$regions"
+    then
+        local array=($regions)
+        local index
+
+        static_mem=0
+        for (( index=1; index<${#array[@]}; index+=2 ))
+        do
+            (( static_mem += ${array[$index]} ))
+        done
+        # The property "memory" is in KB.
+        (( static_mem >>= 10 ))
+
+        if test "$memory" -ne 0 && test "$memory" -ne "$static_mem"
+        then
+            echo "$path: specified DOMU_MEM does not match DOMU_STATIC_MEM amount. Ignoring DOMU_MEM."
+        fi
+        memory=$static_mem
+    fi
+
+    if test "$memory" -eq 0
+    then
+        memory=$((512 * 1024))
+    fi
+
+    dt_set "$path" "memory" "int" "0 $memory"
+}
+
+function add_device_tree_static_mem()
+{
+    local path=$1
+    local regions=$2
+    local cells=()
+    local val
+
+    for val in ${regions[@]}
+    do
+        cells+=("$(printf "0x%x 0x%x" $(($val >> 32)) $(($val & ((1 << 32) - 1))))")
+    done
+
+    dt_set "$path" "xen,static-mem" "hex" "${cells[*]}"
+}
+
+function add_device_tree_xen_static_heap()
+{
+    local path=$1
+    local regions=$2
+    local cells=()
+    local val
+
+    for val in ${regions[@]}
+    do
+        cells+=("$(split_value $val)")
+    done
+
+    dt_set "$path" "xen,static-heap" "hex" "${cells[*]}"
+}
+
+function add_device_tree_static_shared_mem()
+{
+    local path=$1
+    local shared_mem=$2
+    local shared_mem_id=${shared_mem%% *}
+    local regions="${shared_mem#* }"
+    local cells=()
+    local shared_mem_host=${regions%% *}
+
+    dt_mknode "${path}" "shared-mem@${shared_mem_host}"
+
+    for val in ${regions[@]}
+    do
+        cells+=("$(split_value $val)")
+    done
+
+    dt_set "${path}/shared-mem@${shared_mem_host}" "compatible" "str" "xen,domain-shared-memory-v1"
+    dt_set "${path}/shared-mem@${shared_mem_host}" "xen,shm-id" "str" "${shared_mem_id}"
+    dt_set "${path}/shared-mem@${shared_mem_host}" "xen,shared-mem" "hex" "${cells[*]}"
+}
+
+function add_device_tree_cpupools()
+{
+    local cpu
+    local cpus
+    local scheduler
+    local cpu_list
+    local phandle
+    local cpu_phandles
+    local i
+    local j
+
+    i=0
+    while test $i -lt $NUM_CPUPOOLS
+    do
+        cpus=$(echo ${CPUPOOL[$i]} | awk '{print $1}')
+        scheduler=$(echo ${CPUPOOL[$i]} | awk '{print $NF}')
+        cpu_phandles=
+
+        for cpu in ${cpus//,/ }
+        do
+            cpu="/cpus/$cpu"
+
+            # check if cpu exists
+            if ! fdtget "${DEVICE_TREE}" "$cpu" "reg" &> /dev/null
+            then
+                echo "$cpu does not exist"
+                cleanup_and_return_err
+            fi
+
+            # check if cpu is already assigned
+            if [[ "$cpu_list" == *"$cpu"* ]]
+            then
+                echo "$cpu already assigned to another cpupool"
+                cleanup_and_return_err
+            fi
+
+            # set phandle for a cpu if there is none
+            if ! phandle="0x$(fdtget -t x "${DEVICE_TREE}" "$cpu" "phandle" 2> /dev/null)"
+            then
+                get_next_phandle phandle
+                dt_set "$cpu" "phandle" "hex" "$phandle"
+            fi
+
+            cpu_phandles="$cpu_phandles $phandle"
+            cpu_list="$cpu_list $cpu"
+        done
+
+        # create cpupool node
+        get_next_phandle phandle
+        dt_mknode "/chosen" "cpupool_$i"
+        dt_set "/chosen/cpupool_$i" "phandle" "hex" "$phandle"
+        dt_set "/chosen/cpupool_$i" "compatible" "str" "xen,cpupool"
+        dt_set "/chosen/cpupool_$i" "cpupool-cpus" "hex" "$cpu_phandles"
+
+        if test "$scheduler" != "$cpus"
+        then
+            dt_set "/chosen/cpupool_$i" "cpupool-sched" "str" "$scheduler"
+        fi
+
+        j=0
+        while test $j -lt $NUM_DOMUS
+        do
+            # assign cpupool to domU
+            if test "${DOMU_CPUPOOL[$j]}" -eq "$i"
+            then
+                dt_set "/chosen/domU$j" "domain-cpupool" "hex" "$phandle"
+            fi
+            j=$(( $j + 1 ))
+        done
+
+        i=$(( $i + 1 ))
+    done
+}
+
+function xen_device_tree_editing()
+{
+    dt_set "/chosen" "#address-cells" "hex" "0x2"
+    dt_set "/chosen" "#size-cells" "hex" "0x2"
+    dt_set "/chosen" "xen,xen-bootargs" "str" "$XEN_CMD"
+
+    if test "$DOM0_KERNEL"
+    then
+        dt_mknode "/chosen" "dom0"
+        dt_set "/chosen/dom0" "compatible" "str_a" "xen,linux-zimage xen,multiboot-module multiboot,module"
+        dt_set "/chosen/dom0" "reg" "hex" "$(split_addr_size $dom0_kernel_addr $dom0_kernel_size)"
+        dt_set "/chosen" "xen,dom0-bootargs" "str" "$DOM0_CMD"
+    fi
+
+    if test "$DOM0_RAMDISK" && test $ramdisk_addr != "-"
+    then
+        dt_mknode "/chosen" "dom0-ramdisk"
+        dt_set "/chosen/dom0-ramdisk" "compatible" "str_a" "xen,linux-initrd xen,multiboot-module multiboot,module"
+        dt_set "/chosen/dom0-ramdisk" "reg" "hex" "$(split_addr_size $ramdisk_addr $ramdisk_size)"
+    fi
+
+    i=0
+    while test $i -lt $NUM_DOMUS
+    do
+        for devpath in ${DOMU_PASSTHROUGH_PATHS[$i]}
+        do
+            dt_set "$devpath" "xen,passthrough" "str_a"
+        done
+
+        if test "${DOMU_ROOTFS[$i]}" || test "${DOMU_NOBOOT[$i]}"
+        then
+            i=$(( $i + 1 ))
+            continue
+        fi
+        dt_mknode "/chosen" "domU$i"
+        dt_set "/chosen/domU$i" "compatible" "str" "xen,domain"
+        dt_set "/chosen/domU$i" "#address-cells" "hex" "0x2"
+        dt_set "/chosen/domU$i" "#size-cells" "hex" "0x2"
+        add_device_tree_mem "/chosen/domU$i" ${DOMU_MEM[$i]} "${DOMU_STATIC_MEM[$i]}"
+        dt_set "/chosen/domU$i" "cpus" "int" "${DOMU_VCPUS[$i]}"
+        if test "${DOMU_STATIC_MEM[$i]}"
+        then
+            add_device_tree_static_mem "/chosen/domU$i" "${DOMU_STATIC_MEM[$i]}"
+            dt_set "/chosen/domU$i" "direct-map" "bool" "${DOMU_DIRECT_MAP[$i]}"
+        fi
+        dt_set "/chosen/domU$i" "vpl011" "hex" "0x1"
+        if [[ "${DOMU_ENHANCED[$i]}" == 1 || ("$DOM0_KERNEL" && "${DOMU_ENHANCED[$i]}" != 0) ]]
+        then
+            dt_set "/chosen/domU$i" "xen,enhanced" "str" "enabled"
+        fi
+
+        if test -n "${DOMU_SHARED_MEM[i]}"
+        then
+            add_device_tree_static_shared_mem "/chosen/domU${i}" "${DOMU_SHARED_MEM[i]}"
+        fi
+
+        if test "${DOMU_COLORS[$i]}"
+        then
+            local startcolor=$(echo "${DOMU_COLORS[$i]}"  | cut -d "-" -f 1)
+            local endcolor=$(echo "${DOMU_COLORS[$i]}"  | cut -d "-" -f 2)
+            local bitcolors=0
+            local bit=$startcolor
+            while test $bit -le $endcolor
+            do
+                bitcolors=$(( $bitcolors | $(( 1 << $bit)) ))
+                bit=$(( $bit + 1 ))
+            done
+            dt_set "/chosen/domU$i" "colors" "hex" "$(printf "0x%x" $bitcolors)"
+        fi
+
+        add_device_tree_kernel "/chosen/domU$i" ${domU_kernel_addr[$i]} ${domU_kernel_size[$i]} "${DOMU_CMD[$i]}"
+        if test "${domU_ramdisk_addr[$i]}"
+        then
+            add_device_tree_ramdisk "/chosen/domU$i" ${domU_ramdisk_addr[$i]} ${domU_ramdisk_size[$i]}
+        fi
+        if test "${domU_passthrough_dtb_addr[$i]}"
+        then
+            add_device_tree_passthrough "/chosen/domU$i" ${domU_passthrough_dtb_addr[$i]} ${domU_passthrough_dtb_size[$i]}
+        fi
+        i=$(( $i + 1 ))
+    done
+
+    if test "$NUM_CPUPOOLS" && test "$NUM_CPUPOOLS" -gt 0
+    then
+        add_device_tree_cpupools
+    fi
+
+    if test "${XEN_STATIC_HEAP}"
+    then
+        add_device_tree_xen_static_heap "/chosen" "${XEN_STATIC_HEAP}"
+    fi
+}
+
+function linux_device_tree_editing()
+{
+    dt_set "/chosen" "bootargs" "str" "$LINUX_CMD"
+    if test "$LINUX_RAMDISK"
+    then
+        local ramdisk_addr_end="$( printf "0x%x" $(( ramdisk_addr + ramdisk_size )) )"
+        dt_set "/chosen" "linux,initrd-start" "hex" "$ramdisk_addr"
+        dt_set "/chosen" "linux,initrd-end" "hex" "$ramdisk_addr_end"
+    fi
+}
+
+function device_tree_editing()
+{
+    local device_tree_addr=$1
+
+    if test $UBOOT_SOURCE
+    then
+        echo "fdt addr $device_tree_addr" >> $UBOOT_SOURCE
+        echo "fdt resize 1024" >> $UBOOT_SOURCE
+
+        if test $NUM_DT_OVERLAY && test $NUM_DT_OVERLAY -gt 0
+        then
+            i=0
+            while test $i -lt $NUM_DT_OVERLAY
+            do
+                echo "fdt apply ${dt_overlay_addr[$i]}" >> $UBOOT_SOURCE
+                i=$(( $i + 1 ))
+            done
+        fi
+    fi
+
+    if test "$os" = "xen"
+    then
+        xen_device_tree_editing
+    else
+        linux_device_tree_editing
+    fi
+}
+
+# Read effective image size from a header, which may be larger than the filesize
+# due to noload sections, e.g. bss.
+function get_image_size()
+{
+    local image=$1
+    local effective_size=0
+    # Read arm64 header magic (https://www.kernel.org/doc/Documentation/arm64/booting.txt)
+    local arm64_header_magic=$(od -j 56 -N 4 -t x4 ${image} | awk 'NR==1 {print $2}')
+    # Read arm32 header magic (http://www.simtec.co.uk/products/SWLINUX/files/booting_article.html)
+    local arm32_header_magic=$(od -j 36 -N 4 -t x4 ${image} | awk 'NR==1 {print $2}')
+
+    # Check for valid arm64 header magic value 0x644d5241
+    if [ "${arm64_header_magic}" = "644d5241" ]
+    then
+        effective_size=$(od -j 16 -N 8 -t u8 ${image} | awk 'NR==1 {print $2}')
+    # Check for valid arm32 header magic value 0x016f2818
+    elif [ "${arm32_header_magic}" = "016f2818" ]
+    then
+        local start=$(od -j 40 -N 4 -t u4 ${image} | awk 'NR==1 {print $2}')
+        local end=$(od -j 44 -N 4 -t u4 ${image} | awk 'NR==1 {print $2}')
+        effective_size=$(( end - start ))
+    fi
+
+    printf "%u" $effective_size
+}
+
+function add_size()
+{
+    local filename=$1
+    local size=`stat -L --printf="%s" $filename`
+    local image_size=`get_image_size $filename`
+
+    if [ "${image_size}" -gt "${size}" ]
+    then
+        size=${image_size}
+    fi
+
+    memaddr=$(( $memaddr + $size + $offset - 1))
+    memaddr=$(( $memaddr & ~($offset - 1) ))
+    memaddr=`printf "0x%X\n" $memaddr`
+    filesize=$size
+}
+
+function load_file()
+{
+    local filename=$1
+    local fit_scr_name=$2
+
+    local absolute_path="$(realpath --no-symlinks $filename)"
+    local base="$(realpath $PWD)"/
+    local relative_path=${absolute_path#"$base"}
+
+    if test "$FIT"
+    then
+        echo "imxtract \$fit_addr $fit_scr_name $memaddr" >> $UBOOT_SOURCE
+    else
+        echo "$LOAD_CMD $memaddr ${prepend_path:+$prepend_path/}$relative_path" >> $UBOOT_SOURCE
+    fi
+    add_size $filename
+}
+
+function check_file_type()
+{
+    local filename=$1
+    local type="$2"
+
+    if [ ! -f $filename ]
+    then
+        echo "File $filename doesn't exist, exiting";
+        cleanup_and_return_err
+    fi
+
+    # if file doesn't know what it is, it outputs data, so include that
+    # since some executables aren't recongnized
+    if [ "$type" = "executable" ]
+    then
+        type="executable\|data\|ARM OpenFirmware"
+    # file in older distros (ex: RHEL 7.4) just output data for device
+    # tree blobs
+    elif [ "$type" = "Device Tree Blob" ]
+    then
+        type="Device Tree Blob\|data"
+    elif [ "$type" = "text" ]
+    then
+        type="ASCII text"
+    fi
+
+    file -L $filename | grep "$type" &> /dev/null
+    if test $? != 0
+    then
+        echo Wrong file type "$filename". It should be "$type", exiting.
+        cleanup_and_return_err
+    fi
+}
+
+function check_compressed_file_type()
+{
+    local filename=$1
+    local type="$2"
+
+    if [ ! -f $filename ]
+    then
+        echo "File $filename doesn't exist, exiting";
+        cleanup_and_return_err
+    fi
+
+    file -L $filename | grep "gzip compressed data" &> /dev/null
+    if test $? == 0
+    then
+        local tmp=`mktemp`
+        tmp_files+=($tmp)
+        cat $filename | gunzip > $tmp
+        filename=$tmp
+    fi
+    check_file_type $filename "$type"
+}
+
+function find_root_dev()
+{
+
+    local dev=${LOAD_CMD%:*}
+    dev=${dev##* }
+    local par=${LOAD_CMD#*:}
+
+    if [ -z "$dev" ] || [ -z "$par" ]
+    then
+        echo "Could not parse device and partition."
+        echo "Please make sure the load command is correct or manually set {DOM0/LINUX}_CMD in the config file."
+        exit 1
+    fi
+
+    par=$((par + 1))
+
+    if [[ $LOAD_CMD =~ mmc ]]
+    then
+        root_dev="/dev/mmcblk${dev}p${par}"
+    elif [[ $LOAD_CMD =~ scsi ]]
+    then
+        # converts number to a scsi device character
+        dev=$((dev + 97))
+        dev=$(printf %x $dev)
+        dev=$(printf "\x$dev")
+
+        root_dev="/dev/sd${dev}${par}"
+    else
+        echo "Only mmc and scsi are supported for automatically setting the root partition."
+        echo "Manually set {DOM0/LINUX}_CMD with the root device in the config file to bypass this."
+        exit 1
+    fi
+}
+
+function xen_config()
+{
+    if test -z "$DOM0_KERNEL"
+    then
+        if test "$NUM_DOMUS" -eq "0"
+        then
+            echo "Neither dom0 or domUs are specified, exiting."
+            exit 1
+        elif test "$DOM0_MEM" || test "$DOM0_VCPUS" || test "$DOM0_COLORS" || test "$DOM0_CMD" || test "$DOM0_RAMDISK" || test "$DOM0_ROOTFS"
+        then
+            echo "For dom0less configuration without dom0, no dom0 specific parameters should be specified, exiting."
+            exit 1
+        fi
+        echo "Dom0 kernel is not specified, continue with true dom0less setup."
+    fi
+
+    if [ -z "$XEN_CMD" ]
+    then
+        if [ -z "$DOM0_MEM" ]
+        then
+            DOM0_MEM="1024"
+        fi
+
+        if [ -z "$DOM0_VCPUS" ]
+        then
+            DOM0_VCPUS="1"
+        fi
+
+        if test "$DOM0_COLORS"
+        then
+            DOM0_COLORS="dom0_colors=$DOM0_COLORS"
+        fi
+        if test "$XEN_COLORS"
+        then
+            XEN_COLORS="xen_colors=$XEN_COLORS"
+        fi
+
+        XEN_CMD="console=dtuart dtuart=serial0 dom0_mem=${DOM0_MEM}M dom0_max_vcpus=${DOM0_VCPUS} bootscrub=0 vwfi=native sched=null $XEN_COLORS $DOM0_COLORS"
+    else
+        if [ "$DOM0_MEM" ] || [ "$DOM0_VCPUS" ]
+        then
+            echo "One can specify either XEN_CMD or (DOM0_MEM and/or DOM0_VCPUS)"
+            exit
+        fi
+    fi
+
+    if [ -z "$DOM0_CMD" ]
+    then
+        DOM0_CMD="console=hvc0 earlycon=xen earlyprintk=xen clk_ignore_unused"
+    fi
+    if [[ ! $DOM0_CMD =~ root= ]]
+    then
+        if test -z "$DOM0_ROOTFS"
+        then
+            DOM0_CMD="$DOM0_CMD root=/dev/ram0"
+        else
+            find_root_dev
+            # $root_dev is set by find_root_dev
+            DOM0_CMD="$DOM0_CMD root=$root_dev"
+        fi
+    fi
+    if test -z "$DOM0_KERNEL"
+    then
+        # Remove dom0 specific parameters from the XEN command line.
+        local params=($XEN_CMD)
+        XEN_CMD="${params[@]/dom0*/}"
+    fi
+    i=0
+    while test $i -lt $NUM_DOMUS
+    do
+        if test -z "${DOMU_MEM[$i]}"
+        then
+            DOMU_MEM[$i]=0
+        fi
+        DOMU_MEM[$i]=$((${DOMU_MEM[$i]} * 1024))
+        if test -z "${DOMU_VCPUS[$i]}"
+        then
+            DOMU_VCPUS[$i]=1
+        fi
+        if test -z "${DOMU_CMD[$i]}"
+        then
+            DOMU_CMD[$i]="console=ttyAMA0"
+        fi
+        if test -z "${DOMU_DIRECT_MAP[$i]}"
+        then
+             DOMU_DIRECT_MAP[$i]=1
+        fi
+        i=$(( $i + 1 ))
+    done
+}
+
+function linux_config()
+{
+    if [ -z "$LINUX_CMD" ]
+    then
+        LINUX_CMD="earlycon console=ttyPS0,115200"
+    fi
+
+    if [[ ! $LINUX_CMD =~ root= ]]
+    then
+        if test -z "$LINUX_ROOTFS"
+        then
+            LINUX_CMD="$LINUX_CMD root=/dev/ram0"
+        else
+            find_root_dev
+            # $root_dev is set by find_root_dev
+            LINUX_CMD="$LINUX_CMD root=$root_dev"
+        fi
+    fi
+}
+
+generate_uboot_images()
+{
+    local arch=$(file -L $XEN | grep "ARM")
+
+    if test "$arch"
+    then
+        arch=arm
+    else
+        arch=arm64
+    fi
+
+    mkimage -A $arch -T kernel -C none -a $memaddr -e $memaddr -d $XEN "$XEN".ub
+    XEN="$XEN".ub
+}
+
+xen_file_loading()
+{
+    if test "$DOM0_KERNEL"
+    then
+        check_compressed_file_type $DOM0_KERNEL "executable"
+        dom0_kernel_addr=$memaddr
+        load_file $DOM0_KERNEL "dom0_linux"
+        dom0_kernel_size=$filesize
+    fi
+    if test "$DOM0_RAMDISK"
+    then
+        check_compressed_file_type $DOM0_RAMDISK "cpio archive"
+        ramdisk_addr=$memaddr
+        ramdisk_path=$DOM0_RAMDISK
+        load_file "$DOM0_RAMDISK" "dom0_ramdisk"
+        ramdisk_size=$filesize
+    else
+        ramdisk_addr="-"
+    fi
+
+    i=0
+    while test $i -lt $NUM_DOMUS
+    do
+        if test "${DOMU_ROOTFS[$i]}" || test "${DOMU_NOBOOT[$i]}"
+        then
+            if test -z "${DOMU_NOBOOT[$i]}"
+            then
+                echo "Skipping DomU[$i]: cannot handle non-ramdisk rootfs for dom0less VMs."
+            fi
+            i=$(( $i + 1 ))
+            continue
+        fi
+
+        if test -z "${DOMU_KERNEL[$i]}"
+        then
+            echo "DOMU_KERNEL[$i] is not defined"
+            cleanup_and_return_err
+        fi
+
+        check_compressed_file_type ${DOMU_KERNEL[$i]} "executable"
+        domU_kernel_addr[$i]=$memaddr
+        load_file ${DOMU_KERNEL[$i]} "domU${i}_kernel"
+        domU_kernel_size[$i]=$filesize
+        if test "${DOMU_RAMDISK[$i]}"
+        then
+            check_compressed_file_type ${DOMU_RAMDISK[$i]} "cpio archive"
+            domU_ramdisk_addr[$i]=$memaddr
+            load_file ${DOMU_RAMDISK[$i]} "domU${i}_ramdisk"
+            domU_ramdisk_size[$i]=$filesize
+        fi
+        if test "${DOMU_PASSTHROUGH_DTB[$i]}"
+        then
+            check_compressed_file_type ${DOMU_PASSTHROUGH_DTB[$i]} "Device Tree Blob"
+            domU_passthrough_dtb_addr[$i]=$memaddr
+            load_file ${DOMU_PASSTHROUGH_DTB[$i]} "domU${i}_fdt"
+            domU_passthrough_dtb_size[$i]=$filesize
+        fi
+        i=$(( $i + 1 ))
+    done
+
+    # secure boot on uboot expects the last PE image loaded to be the
+    # signed secureboot image used
+    check_compressed_file_type $XEN "executable"
+
+    if test "$BOOT_CMD" = "bootm"
+    then
+        generate_uboot_images
+    fi
+
+    kernel_addr=$memaddr
+    kernel_path=$XEN
+    load_file "$XEN" "host_kernel"
+}
+
+linux_file_loading()
+{
+    check_compressed_file_type $LINUX "executable"
+    kernel_addr=$memaddr
+    kernel_path=$LINUX
+    load_file "$LINUX" "host_kernel"
+
+    if test "$LINUX_RAMDISK"
+    then
+        check_compressed_file_type $LINUX_RAMDISK "cpio archive"
+        ramdisk_addr=$memaddr
+        ramdisk_path=$LINUX_RAMDISK
+        load_file "$LINUX_RAMDISK" "host_ramdisk"
+        ramdisk_size=$filesize
+    else
+        ramdisk_addr="-"
+    fi
+}
+
+bitstream_load_and_config()
+{
+    if test "$BITSTREAM"
+    then
+        check_file_type "$BITSTREAM" "BIT data"
+        bitstream_addr=$memaddr
+        load_file $BITSTREAM "fpga_bitstream"
+        bitstream_size=`printf "0x%X\n" $filesize`
+        if test "$UBOOT_SOURCE"
+        then
+            # we assume the FPGA device is 0 here
+            echo "fpga load 0 $bitstream_addr $bitstream_size" >> "$UBOOT_SOURCE"
+        fi
+    fi
+}
+
+create_its_file_xen()
+{
+    if test "$DOM0_KERNEL"
+    then
+        if test "$ramdisk_addr" != "-"
+        then
+            load_files="\"dom0_linux\", \"dom0_ramdisk\""
+        else
+            load_files="\"dom0_linux\""
+        fi
+        # xen below
+        cat >> "$its_file" <<- EOF
+        dom0_linux {
+            description = "dom0 linux kernel binary";
+            data = /incbin/("$DOM0_KERNEL");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <$dom0_kernel_addr>;
+            $fit_algo
+        };
+	EOF
+    fi
+    # domUs
+    i=0
+    while test $i -lt $NUM_DOMUS
+    do
+        if test "${DOMU_ROOTFS[$i]}" || test "${DOMU_NOBOOT[$i]}"
+        then
+            i=$(( $i + 1 ))
+            continue
+        fi
+        if test -z "$load_files"
+        then
+            load_files+="\"domU${i}_kernel\""
+        else
+            load_files+=", \"domU${i}_kernel\""
+        fi
+        cat >> "$its_file" <<- EOF
+        domU${i}_kernel {
+            description = "domU${i} kernel binary";
+            data = /incbin/("${DOMU_KERNEL[$i]}");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <${domU_kernel_addr[$i]}>;
+            $fit_algo
+        };
+	EOF
+        if test "${DOMU_RAMDISK[$i]}"
+        then
+            load_files+=", \"domU${i}_ramdisk\""
+            cat >> "$its_file" <<- EOF
+        domU${i}_ramdisk {
+            description = "domU${i} ramdisk";
+            data = /incbin/("${DOMU_RAMDISK[$i]}");
+            type = "ramdisk";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <${domU_ramdisk_addr[$i]}>;
+            $fit_algo
+        };
+	EOF
+        fi
+        if test "${DOMU_PASSTHROUGH_DTB[$i]}"
+        then
+            load_files+=", \"domU${i}_fdt\""
+            cat >> "$its_file" <<- EOF
+        domU${i}_fdt {
+            description = "domU${i} fdt";
+            data = /incbin/("${DOMU_PASSTHROUGH_DTB[$i]}");
+            type = "flat_dt";
+            arch = "arm64";
+            compression = "none";
+            load = <${domU_passthrough_dtb_addr[$i]}>;
+            $fit_algo
+        };
+	EOF
+        fi
+        i=$(( $i + 1 ))
+    done
+}
+
+create_its_file()
+{
+    fdt_line="fdt = \"host_fdt\";"
+    cat >> "$its_file" <<- EOF
+/dts-v1/;
+/ {
+    description = "Configuration from Imagebuilder to load Xen/Linux";
+    #address-cells = <1>;
+    images {
+        host_fdt {
+            description = "$os fdt";
+            data = /incbin/("$FDTEDIT");
+            type = "flat_dt";
+            arch = "arm64";
+            compression = "none";
+            load = <$device_tree_addr>;
+            $fit_algo
+        };
+	EOF
+
+    cat >> "$its_file" <<- EOF
+        host_kernel {
+            description = "$os kernel";
+            data = /incbin/("$kernel_path");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <$kernel_addr>;
+            entry = <$kernel_addr>;
+            $fit_algo
+        };
+	EOF
+
+    if test "$ramdisk_addr" != "-"
+    then
+        if test "$os" = "xen"
+        then
+            local rd_name="dom0"
+        else
+            local rd_name="host"
+        fi
+        cat >> "$its_file" <<- EOF
+        ${rd_name}_ramdisk {
+            description = "$rd_name ramdisk";
+            data = /incbin/("$ramdisk_path");
+            type = "ramdisk";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <$ramdisk_addr>;
+            $fit_algo
+        };
+	EOF
+    fi
+
+    if test "$os" = "xen"
+    then
+        create_its_file_xen
+    fi
+
+    if test $NUM_DT_OVERLAY && test $NUM_DT_OVERLAY -gt 0
+    then
+        fdt_line="fdt = \"host_fdt\""
+        i=0
+        while test $i -lt $NUM_DT_OVERLAY
+        do
+            cat >> "$its_file" <<- EOF
+        host_fdto${i} {
+            description = "$os fdt overlay ${i}";
+            data = /incbin/("${DT_OVERLAY[$i]}");
+            type = "flat_dt";
+            arch = "arm64";
+            compression = "none";
+            load = <${dt_overlay_addr[$i]}>;
+            $fit_algo
+        };
+	EOF
+            fdt_line+=", \"host_fdto${i}\""
+            i=$(( $i + 1 ))
+        done
+        fdt_line+=";"
+    fi
+
+    if test "$BITSTREAM"
+    then
+        local fpga_line="fpga = \"fpga_bitstream\";"
+        cat >> "$its_file" <<- EOF
+        fpga_bitstream {
+            description = "FPGA bit stream";
+            data = /incbin/("$BITSTREAM");
+            type = "fpga";
+            arch = "arm64";
+            compression = "none";
+            compatible = "u-boot,fpga-legacy";
+            load = <$bitstream_addr>;
+            $fit_algo
+        };
+	EOF
+    fi
+
+    # script for fit
+    cat >> "$its_file" <<- EOF
+        boot_scr {
+            description = "imagebuilder's boot script";
+            data = /incbin/("$UBOOT_SOURCE");
+            type = "script";
+            compression = "none";
+            load = <$uboot_addr>;
+            entry = <$uboot_addr>;
+            $fit_algo
+        };
+	EOF
+    # end images
+    echo '    };' >> "$its_file"
+
+    # config
+    local ramdisk_line=""
+    if test "$os" = "xen"
+    then
+        local loadables_line="loadables = $load_files;"
+    elif test "$ramdisk_addr" != "-"
+    then
+        local ramdisk_line="ramdisk = \"host_ramdisk\";"
+    fi
+    cat >> "$its_file" <<- EOF
+    configurations {
+        default = "config";
+        config {
+            description = "Imagebuilder $os";
+            kernel = "host_kernel";
+            $fdt_line
+            $ramdisk_line
+            $fpga_line
+            $loadables_line
+        };
+    };
+	EOF
+    # end
+    echo '};' >> "$its_file"
+}
+
+function check_depends()
+{
+    for ((i=0; i<${#prog_req[@]}; i++))
+    do
+        if ! command -v ${prog_req[i]} > /dev/null
+        then
+            echo "Please install the needed program: ${prog_req[i]}."
+            exit 1
+        fi
+    done
+}
+
+function check_boot_cmd()
+{
+    if ! [[ " bootm booti bootz bootefi none " =~ " ${BOOT_CMD}" ]]
+    then
+        echo "\"BOOT_CMD=$BOOT_CMD\" is not valid"
+        exit 1
+    fi
+}
+
+function print_help
+{
+    script=`basename "$0"`
+    echo "usage:"
+    echo "	$script -c CONFIG_FILE -d DIRECTORY [-t LOAD_CMD] [-o FILE] [-k KEY_DIR/HINT [-u U-BOOT_DTB]] [-e] [-f] [-p PREPEND_PATH]"
+    echo "	$script -h"
+    echo "where:"
+    echo "	CONFIG_FILE - configuration file"
+    echo "	DIRECTORY - root directory where the files of CONFIG_FILE are located"
+    echo "	LOAD_CMD can be:"
+    echo "		sd - alias for \"load mmc 0:1\" for uboot load commands"
+    echo "		scsi - alias for \"load scsi 0:1\" for uboot load commands"
+    echo "		usb - alias for \"fatload usb 0:1\" for uboot load commands"
+    echo "		tftp - alias for \"tftpb\" for uboot load cammnds"
+    echo "		< > - used for uboot load commands"
+    echo "	FILE - output filename for the uboot script and its source, overrides option in CONFIG_FILE"
+    echo "	KEY_DIR - key directory used for signing a fit image"
+    echo "	HINT - the file name of the crt and key file minus the suffix (ex, hint.crt and hint.key)"
+    echo "	U-BOOT_DTB - u-boot control dtb so that the public key gets added to it"
+    echo "	-f - enable generating a FIT image"
+    echo "	PREPEND_PATH - path to be appended before file names to match deploy location within rootfs"
+    echo "	-h - prints out the help message and exits "
+    echo "Defaults:"
+    echo "	CONFIG_FILE=$cfg_file, UBOOT_TYPE=\"LOAD_CMD\" env var, DIRECTORY=$uboot_dir"
+    echo "Example:"
+    echo "	$script -c ../config -d ./build42 -t \"scsi load 1:1\""
+}
+
+while getopts ":c:t:d:ho:k:u:fp:" opt; do
+    case ${opt} in
+    t )
+        case $OPTARG in
+        scsi )
+            load_opt="load scsi 0:1"
+            ;;
+        sd )
+            load_opt="load mmc 0:1"
+            ;;
+        virtio )
+            load_opt="load virtio 0:1"
+            ;;
+        usb )
+            load_opt="fatload usb 0:1"
+            ;;
+        tftp )
+            load_opt="tftpb"
+            ;;
+        * )
+            load_opt="$OPTARG"
+            ;;
+        esac
+        ;;
+    c )
+        cfg_file=$OPTARG
+        ;;
+    d )
+        uboot_dir=$OPTARG
+        ;;
+    o )
+        uboot_out_opt=$OPTARG
+        ;;
+    k )
+        fits_keyd_opt=$OPTARG
+        ;;
+    u )
+        fits_dtb_opt=$OPTARG
+        ;;
+    f )
+        fit_opt=y
+        ;;
+    p )
+        prepend_path="$OPTARG"
+        ;;
+    h )
+        print_help
+        exit 0
+        ;;
+    * )
+        echo "Unknown option, see \"$0 -h\""
+        exit 1
+        ;;
+    esac
+done
+shift $((OPTIND -1))
+
+if test ! "$cfg_file" -o ! "$uboot_dir"
+then
+    echo "Undefined arguments, see \"$0 -h\""
+    exit 1
+fi
+
+check_depends
+
+source "$cfg_file"
+
+SCRIPT_PATH=$(dirname "$0")
+source "$SCRIPT_PATH/common"
+
+# command line overrides
+LOAD_CMD=${load_opt:-$LOAD_CMD}
+FIT_ENC_KEY_DIR=${fits_keyd_opt:-$FIT_ENC_KEY_DIR}
+FIT_ENC_UB_DTB=${fits_dtb_opt:-$FIT_ENC_UB_DTB}
+if [ ! -z "$uboot_out_opt" ]
+then
+    UBOOT_SCRIPT="$uboot_out_opt".scr
+    UBOOT_SOURCE="$uboot_out_opt".source
+fi
+if test "$fit_opt" && ! test "$FIT"
+then
+    FIT="${UBOOT_SOURCE%.source}.fit"
+fi
+
+if test ! "$LOAD_CMD"
+then
+    echo "LOAD_CMD not set, either specify it in the config or set it with the -t option"
+    exit 1
+fi
+
+if test ! "$BOOT_CMD"
+then
+    BOOT_CMD="booti"
+else
+    check_boot_cmd
+fi
+
+if test -z "$NUM_DOMUS"
+then
+    NUM_DOMUS=0
+fi
+
+if test "$XEN"
+then
+    os="xen"
+    xen_config
+elif test "$LINUX"
+then
+    os="linux"
+    linux_config
+else
+    echo "Neither a Xen or Linux kernel is specified, exiting"
+    exit 1
+fi
+
+fit_algo=$'hash {\n                algo = "md5";\n            };'
+if test "$FIT_ENC_KEY_DIR" || test "$FIT_ENC_UB_DTB"
+then
+    if ! test "$FIT_ENC_KEY_DIR" && test "$FIT_ENC_UB_DTB"
+    then
+        echo "if encryption, you need to specify the key directory"
+        exit 1
+    fi
+
+    key_hint="${FIT_ENC_KEY_DIR##*/}"
+    key_dir="${FIT_ENC_KEY_DIR%/*}/"
+
+    fit_enc_opt="-r -k $key_dir"
+    if test "$FIT_ENC_UB_DTB"
+    then
+        fit_enc_opt+=" -K $FIT_ENC_UB_DTB"
+    fi
+    fit_algo=$'signature {\n                algo = \"sha1,rsa2048\";\n                key-name-hint = \"'"$key_hint"$'\";\n};'
+fi
+
+# the cd is needed so that the relative paths will match once we use
+# tftp or move the files to a partition
+cd "$uboot_dir"
+
+# If both PASSTHROUGH_DTS_REPO and LOPPER_PATH options are specified,
+# the former takes precedence because the partial device trees are already
+# created (probably tested), hence the reliability is higher than using lopper.
+if test "$PASSTHROUGH_DTS_REPO" || test "$LOPPER_PATH"
+then
+    output_dir=`mktemp -d "partial-dtbs-XXX"`
+    if test "$PASSTHROUGH_DTS_REPO"
+    then
+        compile_merge_partial_dts $output_dir "$PASSTHROUGH_DTS_REPO"
+    else
+        if test -z "$LOPPER_CMD"
+        then
+            # Default for ZynqMP MPSoC.
+            # The following command instructs lopper's extract assist to always
+            # include zynqmp-firmware node (as it contains e.g. clock-controller
+            # required by most of the devices) in the extracted tree structure
+            # and to drop nodes/properties during the extraction process that
+            # are not needed.
+            LOPPER_CMD="-i zynqmp-firmware -x interrupt-controller -x pinctrl -x power-domains -x resets -x current-speed"
+        fi
+        compile_merge_partial_dts $output_dir
+    fi
+    if test $? -ne 0
+    then
+        # Remove the output dir holding the partial dtbs in case of any error
+        tmp_dirs+=($output_dir)
+        cleanup_and_return_err
+    fi
+fi
+
+if test "$FIT"
+then
+    if ! test "$FDTEDIT"
+    then
+        FDTEDIT="${DEVICE_TREE%.dtb}-fit.dtb"
+    fi
+    its_file="${FIT%.fit}.its"
+    rm -f "$its_file"
+fi
+
+if test $FDTEDIT
+then
+    rm -f "$FDTEDIT"
+    cp "$DEVICE_TREE" "$FDTEDIT"
+
+    if test "$NUM_DT_OVERLAY" && test "$NUM_DT_OVERLAY" -gt 0
+    then
+        i=0
+        while test $i -lt "$NUM_DT_OVERLAY"
+        do
+            if [ ! -f "${DT_OVERLAY[$i]}" ]
+            then
+                echo "Can not find ${DT_OVERLAY[$i]}, exiting"
+                cleanup_and_return_err
+            fi
+            fdtoverlay -i "$FDTEDIT" -o "$FDTEDIT" "${DT_OVERLAY[$i]}"
+            if test "$?" -ne "0"
+            then
+                echo "Can add overlay ${DT_OVERLAY[$i]} to $FDTEDIT, exiting"
+                cleanup_and_return_err
+            fi
+            i=$(( $i + 1 ))
+        done
+        NUM_DT_OVERLAY=0
+    fi
+fi
+
+rm -f $UBOOT_SOURCE $UBOOT_SCRIPT
+
+if test "$FIT"
+then
+    echo 'fit_addr=$fileaddr' >>  $UBOOT_SOURCE
+fi
+
+memaddr=$(( $MEMORY_START + $offset ))
+# 12582912 is 0xc00000, 12MB
+if test $memaddr -lt 12582912
+then
+    memaddr="12582912"
+fi
+memaddr=`printf "0x%X\n" $memaddr`
+uboot_addr=$memaddr
+# 2MB are enough for a uboot script
+memaddr=$(( $memaddr + $offset ))
+memaddr=`printf "0x%X\n" $memaddr`
+
+if test "$os" = "xen"
+then
+    xen_file_loading
+else
+    linux_file_loading
+fi
+
+if test $NUM_DT_OVERLAY && test $NUM_DT_OVERLAY -gt 0
+then
+    i=0
+    while test $i -lt $NUM_DT_OVERLAY
+    do
+        if [ ! -f "${DT_OVERLAY[$i]}" ]
+        then
+            echo "Can not find ${DT_OVERLAY[$i]}, exiting"
+            cleanup_and_return_err
+        fi
+        check_file_type "${DT_OVERLAY[$i]}" "Device Tree Blob"
+        dt_overlay_addr[$i]=$memaddr
+        load_file "${DT_OVERLAY[$i]}" "host_fdto${i}"
+        i=$(( $i + 1 ))
+    done
+fi
+
+check_file_type $DEVICE_TREE "Device Tree Blob"
+device_tree_addr=$memaddr
+load_file $DEVICE_TREE "host_fdt"
+bitstream_load_and_config  # bitstream is loaded last but used first
+device_tree_editing $device_tree_addr
+
+# disable device tree reloation
+echo "setenv fdt_high 0xffffffffffffffff" >> $UBOOT_SOURCE
+
+# append extra u-boot commands (fixups) to script before boot command
+if test "$APPEND_EXTRA_CMDS"
+then
+    check_file_type "$APPEND_EXTRA_CMDS" "text"
+    cat $APPEND_EXTRA_CMDS >> $UBOOT_SOURCE
+fi
+
+if [ "$BOOT_CMD" != "none" ]
+then
+    echo "$BOOT_CMD $kernel_addr - $device_tree_addr" >> $UBOOT_SOURCE
+else
+    # skip boot command but store load addresses to be used later
+    echo "setenv host_kernel_addr $kernel_addr" >> $UBOOT_SOURCE
+    echo "setenv host_fdt_addr $device_tree_addr" >> $UBOOT_SOURCE
+fi
+
+if test "$FIT"
+then
+    create_its_file
+    mkimage -q -f "$its_file" $fit_enc_opt "$FIT"
+else
+    mkimage -A arm64 -T script -C none -a $uboot_addr -e $uboot_addr -d $UBOOT_SOURCE "$UBOOT_SCRIPT" &> /dev/null
+fi
+
+remove_tmp_files
+
+fit_addr="$(printf "0x%x" $memaddr)"
+
+if test "$FIT"
+then
+    memaddr=$(( $MEMORY_END - 2 * ( $memaddr + $offset ) ))
+else
+    memaddr=$(( $MEMORY_END - $memaddr - $offset ))
+fi
+if test $memaddr -lt 0
+then
+    echo Error, not enough memory to load all binaries
+    cleanup_and_return_err
+fi
+
+if test "$FIT"
+then
+    echo "Generated uboot FIT image $FIT, to be loaded at or after address $fit_addr:"
+    echo "$LOAD_CMD $fit_addr $FIT; source $fit_addr:boot_scr"
+else
+    echo "Generated uboot script $UBOOT_SCRIPT, to be loaded at address $uboot_addr:"
+    echo "$LOAD_CMD $uboot_addr ${prepend_path:+$prepend_path/}$UBOOT_SCRIPT; source $uboot_addr"
+fi

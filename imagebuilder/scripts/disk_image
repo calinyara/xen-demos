@@ -1,0 +1,925 @@
+#!/bin/bash
+
+PROG_REQ=( kpartx mkfs.ext4 mkfs.vfat losetup readlink awk parted )
+SLACK=128
+
+function cleanup_disk_image()
+{
+    kpartx -d /dev/mapper/diskimage
+    dmsetup remove diskimage
+    losetup -d $_loop_dev
+
+    remove_tmp_files
+
+    if [ "$DESTDIR_DEL" = true ]
+    then
+        rm -rf "$DESTDIR"
+    fi
+}
+
+function cleanup_disk_image_error()
+{
+    cleanup_disk_image
+    rm $IMG
+}
+
+function check_depends()
+{
+    for ((i=0; i<${#PROG_REQ[@]}; i++))
+    do
+        if ! command -v ${PROG_REQ[i]} > /dev/null
+        then
+            echo "Please install the needed program: ${PROG_REQ[i]}."
+            exit 1
+        fi
+    done
+}
+
+function add_rootfs()
+{
+    local dev=${LOAD_CMD%:*}
+    dev=${dev##* }
+    local par=${LOAD_CMD#*:}
+    local j=$1
+
+    if [ -z "$dev" ] || [ -z "$par" ]
+    then
+        echo "Could not parse device and partition."
+        exit 1
+    fi
+
+    par=$(( $par + $j ))
+
+    if [[ $LOAD_CMD =~ mmc ]]
+    then
+        retval="/dev/mmcblk${dev}p${par}"
+    elif [[ $LOAD_CMD =~ scsi ]]
+    then
+        # converts number to a scsi device character
+        dev=$((dev + 97))
+        dev=$(printf %x $dev)
+        dev=$(printf "\x$dev")
+
+        retval="/dev/sd${dev}${par}"
+    else
+        echo "Only mmc and scsi are supported for automatically setting the root partition."
+        echo "Manually set DOM0_CMD with the root device in the config file to bypass this."
+        exit 1
+    fi
+}
+
+function get_interrupts()
+{
+    local xen_intr_txt="$1"
+    local num_fields
+    local intr_num
+    local intr_str
+    local val
+    local i
+
+    while IFS= read -r val
+    do
+        #Remove the prefix "interrupts = <"
+        val=${val#*"interrupts = <"}
+
+        #Remove the suffix ">;" from each line
+        val=${val%>;*}
+
+        num_fields=`echo $val | awk '{print NF}'`
+
+        #We expect the following format
+        #interrupts = <0x00 irq_no flags 0x00 irq_no flags 0x00 irq_no flags ..>;
+        if test $((num_fields % 3)) -ne 0
+        then
+            return 1
+        fi
+
+        #Position of the first interrupt no
+        i=2
+        while test $i -lt $num_fields
+        do
+            intr_num=`echo $val | awk -v i="$i" '{print $i}'`
+
+            #The next irq_no will be after 3 places
+            i=$((i+3))
+
+            intr_num=$((intr_num + 32))
+
+            if test "$intr_str"
+            then
+                intr_str="$intr_str,"
+            fi
+            intr_str="$intr_str"$intr_num
+        done
+
+    done < "$xen_intr_txt"
+
+    if test  "$intr_str"
+    then
+        echo "$intr_str"
+    fi
+}
+
+function contains()
+{
+    local item="$1"
+    local list="$2"
+    local each
+
+    for each in $list
+    do
+        if test "$each" = "$item"
+        then
+            echo "yes"
+        fi
+    done
+}
+
+function check_if_force_assign_iommu()
+{
+    local xen_path="$1"
+    local dtb="$2"
+    local node="$3"
+    local path
+    local subnode
+    local subnode_cnt
+    local props
+    local xen_path_present
+    local assign_present
+
+    subnode_cnt=$(fdtget -l "$dtb" "$node" | wc -l)
+
+    props=$(fdtget -p "$dtb" "$node")
+    xen_path_present=$(contains "xen,path" "$props")
+    assign_present=$(contains "xen,force-assign-without-iommu" "$props")
+
+    if test "$xen_path_present" = "yes" && test "$assign_present" = "yes"
+    then
+        path=$(fdtget "$dtb" "$node" "xen,path")
+        if test "$path" = "$xen_path"
+        then
+            echo "yes"
+            return 0
+        fi
+    fi
+
+    if test $subnode_cnt -gt 0
+    then
+        for subnode in `fdtget -l  "$dtb" "$node"`
+        do
+            subnode="$node/$subnode"
+            check_if_force_assign_iommu "$xen_path" "$dtb" "$subnode"
+        done
+    fi
+}
+
+function get_iommu_prop()
+{
+    local xen_path_txt="$1"
+    local domU_dtb="$2"
+    local dtdev_str
+    local devpath
+    local force_assign
+
+    #Iterate through all the lines in the file
+    while IFS= read -r devpath
+    do
+        #Extract the path of the device from each line
+        #
+        #For eg, the line may be as follows
+        #xen,path = "/axi/serial@ff010000";
+        #
+        #What we want is the following substring
+        #"/axi/serial@ff010000"
+        devpath=`echo $devpath | awk '{print $3}'`
+        devpath=${devpath#*\"}
+        devpath=${devpath%\";*}
+
+        force_assign=$(check_if_force_assign_iommu "$devpath" "$domU_dtb" "/passthrough")
+
+        if test -z "$force_assign"
+        then
+            if test "$dtdev_str"
+            then
+                dtdev_str="$dtdev_str, "
+            fi
+            dtdev_str=${dtdev_str}"\""${devpath}"\""
+        fi
+
+    done < "$xen_path_txt"
+
+    if test "$dtdev_str"
+    then
+        echo "$dtdev_str"
+    fi
+}
+
+function get_iomem()
+{
+    local xen_reg_txt="$1"
+    local addr="$2"
+    local size="$3"
+    local val
+    local i
+    local num_fields
+    local iomem_str
+    local address_size_pair
+    local mfn
+    local gfn
+    local size_
+    local PAGE_SHIFT=12
+
+    #Iterate through all the lines in the file
+    #The file will look similar to the following:-
+    #
+    #xen,reg = <0x00 0xff010000 0x00 0x1000 0x00 0xff010000 0x00 0xff110000 0x00 0x1000 0x00 0xff110000 0x00 0xff120000 0x00 0x1000 0x00 0xff120000 0x00 0xff130000 0x00 0x1000 0x00 0xff130000 0x00 0xff140000 0x00 0x1000 0x00 0xff140000>;
+    #xen,reg = <0x00 0xfd0c0000 0x00 0x2000 0x00 0xfd0c0000>;
+    while IFS= read -r val
+    do
+        #Remove the prefix "xen,reg = <" from each line
+        val=${val#*"xen,reg = <"}
+
+        #Remove the suffix ">;" from each line
+        val=${val%>;*}
+
+        num_fields=`echo $val | awk '{print NF}'`
+
+        i=0
+
+        while test $i -lt $num_fields
+        do
+
+            i=$((i + addr))
+
+            #Extract the iomem physical address
+            mfn=`echo $val | awk -v i="$i" '{print $i}'`
+
+            #Calculate the page address
+            mfn=0x$(printf "%X" $(( $((mfn>>PAGE_SHIFT)) & 0xfffff)) )
+
+            i=$((i + size))
+
+            #Extract the size of the iomem address
+            size_=`echo $val | awk -v i="$i" '{print $i}'`
+
+            #Calculatde the number of pages
+            size_=$(printf "%X" $(( $((size_>>PAGE_SHIFT)) & 0xfffff)) )
+
+            i=$((i + addr))
+
+            #Extract the iomem guest address
+            gfn=`echo $val | awk -v i="$i" '{print $i}'`
+
+            #Calculate the page address
+            gfn=0x$(printf "%X" $(( $((gfn>>PAGE_SHIFT)) & 0xfffff)) )
+
+            if test "$gfn" != "$mfn"
+            then
+                address_size_pair="\"$mfn,${size_}@${gfn}\""
+            else
+                address_size_pair="\"$mfn,$size_\""
+            fi
+
+            if test "$iomem_str"
+            then
+                iomem_str="$iomem_str, $address_size_pair"
+            else
+                iomem_str=$address_size_pair
+            fi
+        done
+
+    done < "$xen_reg_txt"
+
+    if test "$iomem_str"
+    then
+        echo "$iomem_str"
+    fi
+}
+
+function update_domU_cfg()
+{
+    local domU_dtb="$1"
+    local domU_cfg_file="$2"
+    local addr=$(fdtget $domU_dtb /passthrough \#address-cells)
+    local size=$(fdtget $domU_dtb /passthrough \#size-cells)
+    local iomem_str
+    local dtdev_str
+    local intr_str
+    local tmp_dts
+    local tmp_search_results
+
+    tmp_dts=`mktemp`
+    tmp_files+=($tmp_dts)
+    dtc -I dtb -O dts -o "$tmp_dts" "$domU_dtb"
+
+    tmp_search_results=`mktemp`
+    tmp_files+=($tmp_search_results)
+
+    #Let's get all the lines containing xen,path in a file
+    grep 'xen,reg' "$tmp_dts" > "$tmp_search_results"
+
+    #From "xen,reg", one can determine the "iomem" attribute of the
+    #cfg file.
+    iomem_str="$(get_iomem $tmp_search_results $addr $size)"
+    if test -z "$iomem_str"
+    then
+        echo "Error occurred while generating the iomem property"
+        return 1
+    else
+        iomem_str="iomem = [ "$iomem_str" ]"
+        echo "${iomem_str}" >> $domU_cfg_file
+    fi
+
+    #Let's get all the lines containing xen,path in a file
+    grep 'xen,path' $tmp_dts > $tmp_search_results
+
+    #From "xen,path", one can determine the "dtdev" attribute of the
+    #cfg file. This attribute is optional.
+    dtdev_str=$(get_iommu_prop $tmp_search_results $domU_dtb)
+    if test "$dtdev_str"
+    then
+        dtdev_str="dtdev = [ "$dtdev_str" ]"
+        echo "${dtdev_str}" >> $domU_cfg_file
+    fi
+
+    #Let's get all the lines containing interrupts in a file
+    grep 'interrupts' $tmp_dts > $tmp_search_results
+
+    #From "interrupts", one can determine the "irqs" attribute of the
+    #cfg file.
+    intr_str=$(get_interrupts $tmp_search_results)
+    if test "$intr_str"
+    then
+        intr_str="irqs = [ "$intr_str" ]"
+        echo "${intr_str}" >> $domU_cfg_file
+    fi
+
+    return 0
+}
+
+function generate_domU_configs()
+{
+    local i=0
+    local j=$1
+    # $j + 1 - 1 as it is starting from 0
+    local n=$1
+    local dest
+    local dtb_name
+
+    mount /dev/mapper/diskimage$j $DESTDIR/part/disk$j
+    mkdir -p $DESTDIR/part/disk$j/etc/xen
+    add_rootfs 0
+    first_part=$retval
+
+    while test $i -lt $NUM_DOMUS
+    do
+        if test "${DOMU_NOBOOT[$i]}"
+        then
+            if test -z "${DOMU_PASSTHROUGH_DTB[$i]}" && test "${DOMU_PASSTHROUGH_PATHS[$i]}"
+            then
+                output_dir=`mktemp -d`
+                tmp_dirs+=($output_dir)
+
+                # Check if the below function returns error
+                # and unmount the partition
+                compile_merge_partial_dts $output_dir "$PASSTHROUGH_DTS_REPO"
+                if test $? -ne 0
+                then
+                    umount $DESTDIR/part/disk$j
+                    cleanup_disk_image_error
+                    exit 1
+                fi
+            fi
+
+            dest="$DESTDIR/part/disk$j/etc/xen/domU$i.cfg"
+            echo "name=\"domU$i\"" >> $dest
+            echo "memory=${DOMU_MEM[$i]}" >> $dest
+            echo "vcpus=${DOMU_VCPUS[$i]}" >> $dest
+
+            if test "${DOMU_DRIVER_DOMAIN[$i]}"
+            then
+                echo "driver_domain=${DOMU_DRIVER_DOMAIN[$i]}" >> $dest
+            fi
+
+            echo "# mount $first_part /boot" >> $dest
+            echo "kernel=\"/boot/${DOMU_KERNEL[$i]}\"" >> $dest
+            if test "${DOMU_RAMDISK[$i]}"
+            then
+                echo "ramdisk=\"/boot/${DOMU_RAMDISK[$i]}\"" >> $dest
+            fi
+
+            if [ -z "${DOMU_CMD[$i]}" ]
+            then
+                DOMU_CMD[$i]="console=hvc0"
+            fi
+            if [[ ! ${DOMU_CMD[$i]} =~ root= ]]
+            then
+                if test -z "${DOMU_ROOTFS[$i]}"
+                then
+                    DOMU_CMD[$i]="${DOMU_CMD[$i]} root=/dev/ram0" >> $dest
+                else
+                    DOMU_CMD[$i]="${DOMU_CMD[$i]} root=/dev/xvda" >> $dest
+                fi
+            fi
+            echo "extra=\"${DOMU_CMD[$i]}\"" >> $dest
+            if test "${DOMU_ROOTFS[$i]}"
+            then
+                add_rootfs $n
+                echo "disk=[\"$retval,,xvda\"]" >> $dest
+            fi
+
+            if test "${DOMU_PASSTHROUGH_DTB[$i]}"
+            then
+                cp ${DOMU_PASSTHROUGH_DTB[$i]} $DESTDIR/part/disk$j/etc/xen/
+                dtb_name="$(basename ${DOMU_PASSTHROUGH_DTB[$i]})"
+                echo "device_tree=\"/etc/xen/$dtb_name\"" >> $dest
+                update_domU_cfg  ${DOMU_PASSTHROUGH_DTB[$i]} $dest
+                if test $? -ne 0
+                then
+                    umount $DESTDIR/part/disk$j
+                    cleanup_disk_image_error
+                    exit 1
+                fi
+            fi
+        fi
+
+        n=$(( $n + 1 ))
+        i=$(( $i + 1 ))
+    done
+
+    umount $DESTDIR/part/disk$j
+}
+
+function add_partition()
+{
+    local rootfs="$1"
+    local aux_dir=$(mktemp -d)
+
+    cd "$aux_dir"
+
+    if [[ $rootfs = *.cpio ]]
+    then
+        cat "${UBOOT_OUT_ABS}/$rootfs" | cpio -id
+    elif [[ $rootfs = *.cpio.gz ]]
+    then
+        cat "${UBOOT_OUT_ABS}/$rootfs" | gunzip | cpio -id
+    elif [[ $rootfs = *.tar.gz ]]
+    then
+        tar -xf "${UBOOT_OUT_ABS}/$rootfs"
+    else
+        echo "Ignoring $rootfs: unsupported file format. Use cpio or cpio.gz or tar.gz."
+        exit 1
+    fi
+
+    _part_size=$(du -sb| awk '{print $1}')
+    cd -
+    rm -rf "$aux_dir"
+
+    _part_size=$(( $_part_size + $offset - 1))
+    _part_size=$(( $_part_size & ~($offset - 1) ))
+    # account for gzip compression
+    _part_size=$(( $_part_size * 2 ))
+    # add some slack
+    _part_size=$(( $SLACK*1024*1024 + $_part_size ))
+    _part_size=$(( $_part_size / 1024 / 1024 ))
+    echo PART size: "$_part_size"MB
+    
+    prev=$(( $_npart - 1 ))
+    _sector_start[$_npart]=$(( ${_sector_end[$prev]} + 1 ))
+    _sector_end[$_npart]=$(( $_part_size * 1024 * 1024 / $_sector_size + ${_sector_start[$_npart]} - 1))
+
+    _tot_size=$(( $_tot_size + $_part_size ))
+    _npart=$(( $_npart + 1 ))
+}
+
+function align_size_power_of_two()
+{
+    local _cnt_bits=0
+    local num=$1
+    local _num=$num
+    while [ $_num -ne 0 ]
+    do
+        _num=$((_num >> 1))
+        _cnt_bits=$((_cnt_bits + 1))
+    done
+    _num=$((1<<(_cnt_bits - 1)))
+    if [ $num -gt $_num ]
+    then
+        _num=$((1<<_cnt_bits))
+    fi
+    echo $_num
+}
+
+function write_rootfs()
+{
+    local j=$1
+    local rootfs=$2
+
+    # create mount point and mount diskn
+    mkdir -p ${DESTDIR}/part/disk$j
+    mount /dev/mapper/diskimage$j $DESTDIR/part/disk$j
+    
+    # Extract rootfs cpio archive into `.../part/vos_$j`
+    cd ${DESTDIR}/part/disk$j
+
+    if [[ $rootfs = *.cpio ]]
+    then
+        cat "${UBOOT_OUT_ABS}/$rootfs" | cpio -id
+    elif [[ $rootfs = *.cpio.gz ]]
+    then
+        cat "${UBOOT_OUT_ABS}/$rootfs" | gunzip | cpio -id
+    elif [[ $rootfs = *.tar.gz ]]
+    then
+        tar -xf "${UBOOT_OUT_ABS}/$rootfs"
+    else
+        echo "Ignoring $rootfs: unsupported file format. Use cpio or cpio.gz or tar.gz."
+    fi
+
+    cd -
+    # umount
+    sync
+    umount $DESTDIR/part/disk$j
+}
+
+function print_help
+{
+    echo "usage:"
+    echo "	$0 -c CONFIG_FILE -d UBOOT_DIRECTORY -t UBOOT_TYPE <-w WORK_DIRECTORY> <-s SLACK> <-a> -o IMG_FILE <-p PREPEND_PATH>"
+    echo "	$0 -h"
+    echo "where:"
+    echo "	-c CONFIG_FILE - configuration file"
+    echo "	-d UBOOT_DIRECTORY - root directory for the paths specified in CONFIG_FILE"
+    echo "	-t UBOOT_TYPE can be:"
+    echo "		sd - alias for \"mmc load 0:1\" for uboot load commands"
+    echo "		scsi - alias for \"scsi load 0:1\" for uboot load commands"
+    echo "		tftp - alias for \"tftpb\" for uboot load cammnds"
+    echo "		< > - used for uboot load commands"
+    echo "	-w WORK_DIRECTORY - work directory used when building the image"
+    echo "	-s SLACK - free MB to add to each partition, default 128"
+    echo "	-a specifies that the size of IMG_FILE has to be aligned to the nearest power of two"
+    echo "	-o IMG_FILE - the output img file "
+    echo "	-p PREPEND_PATH - path to be appended before file names to customize deploy location within rootfs"
+    echo "Example:"
+    echo "	$0 -c ../config -d ./build42 -w tmp -o disk.img"
+}
+
+# before anything else, check if we have root privilege
+if ! [ $(id -u) = 0 ]
+then
+    echo "This script needs root privilege to run, exiting."
+    exit 1
+fi
+
+while getopts ":w:d:c:t:s:o:ahp:" opt
+do
+    case ${opt} in
+    t )
+        case $OPTARG in
+        scsi )
+            LOAD_CMD="load scsi 0:1"
+            ;;
+        sd )
+            LOAD_CMD="load mmc 0:1"
+            ;;
+        tftp )
+            LOAD_CMD="tftpb"
+            ;;
+        * )
+            LOAD_CMD="$OPTARG"
+            ;;
+        esac
+        ;;
+    s )
+        SLACK=$OPTARG
+        if ! test $SLACK -gt 0
+        then
+            echo "Invalid SLACK parameter."
+            exit 1
+        fi
+        ;;
+    w )
+        DESTDIR=$OPTARG
+        ;;
+    d )
+        UBOOT_OUT=$OPTARG
+        ;;
+    c )
+        CFG_FILE=$OPTARG
+        ;;
+    o )
+        IMG=$OPTARG
+        ;;
+    a )
+        ALIGN=1
+        ;;
+    p )
+        PREPEND_PATH="$OPTARG"
+        ;;
+    h )
+        print_help
+        exit 0
+        ;;
+    * )
+        echo "Unknown option, see \"$0 -h\""
+        exit 1
+        ;;
+    esac
+done
+shift $((OPTIND -1))
+
+if [ -z "$UBOOT_OUT" ] || [ -z "$CFG_FILE" ] || [ -z "$IMG" ]
+then
+    echo "Undefined arguments, see \"$0 -h\""
+    exit 1
+fi
+
+# if the user hasn't specified a working directing, create it
+if [ -z "$DESTDIR" ]
+then
+    DESTDIR="$(mktemp -d /tmp/imagebuilder.XXXXXX)"
+    DESTDIR_DEL=true
+else
+    DESTDIR_DEL=false
+fi
+
+UBOOT_OUT_ABS="$(readlink -f $UBOOT_OUT)"
+DESTDIR_ABS="$(readlink -f $DESTDIR)"
+
+check_depends
+
+source "$CFG_FILE"
+
+SCRIPT_PATH=$(dirname "$0")
+source "$SCRIPT_PATH/common"
+
+i=0
+while test $i -lt $NUM_DOMUS
+do
+    if test -z "${DOMU_MEM[$i]}"
+    then
+        DOMU_MEM[$i]=512
+    fi
+    if test -z "${DOMU_VCPUS[$i]}"
+    then
+        DOMU_VCPUS[$i]=1
+    fi
+    i=$(( $i + 1 ))
+done
+
+offset=$((2*1024*1024))
+_part1_size=`stat -L --printf="%s" $UBOOT_OUT/$DOM0_KERNEL`
+_part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/$DEVICE_TREE` ))
+_part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/$UBOOT_SCRIPT` ))
+
+if test "${DOM0_RAMDISK}"
+then
+    _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/${DOM0_RAMDISK}` ))
+fi
+if test "$NUM_DT_OVERLAY" && test "$NUM_DT_OVERLAY" -gt 0
+then
+    i=0
+    while test $i -lt "$NUM_DT_OVERLAY"
+    do
+        _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/${DT_OVERLAY[$i]}` ))
+        i=$(( $i + 1 ))
+    done
+fi
+if test "${UBOOT_SOURCE}"
+then
+    _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/$UBOOT_SOURCE` ))
+fi
+if test "${XEN}"
+then
+    _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/$XEN` ))
+fi
+if test "$NUM_BOOT_AUX_FILE"  && test "$NUM_BOOT_AUX_FILE" -gt 0
+then
+    i=0
+    while test $i -lt "$NUM_BOOT_AUX_FILE"
+    do
+        if [ ! -f "$UBOOT_OUT/${BOOT_AUX_FILE[$i]}" ]
+        then
+            echo "Can not find ${BOOT_AUX_FILE[$i]}, exiting"
+        fi
+        _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/${BOOT_AUX_FILE[$i]}` ))
+        i=$(( $i + 1 ))
+    done
+fi
+if test "${BITSTREAM}"
+then
+    _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/$BITSTREAM` ))
+fi
+
+i=0
+while test $i -lt $NUM_DOMUS
+do
+    _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/${DOMU_KERNEL[$i]}` ))
+    if test "${DOMU_RAMDISK[$i]}"
+    then
+        _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/${DOMU_RAMDISK[$i]}` ))
+    fi
+    if test "${DOMU_PASSTHROUGH_DTB[$i]}"
+    then
+        _part1_size=$(( $_part1_size + `stat -L --printf="%s" $UBOOT_OUT/${DOMU_PASSTHROUGH_DTB[$i]}` ))
+    fi
+    i=$(( $i + 1 ))
+done
+
+# add 16 MB slack
+_part1_size=$(( $_part1_size + 16777216 ))
+_part1_size=$(( $_part1_size + $offset - 1))
+_part1_size=$(( $_part1_size & ~($offset - 1) ))
+_part1_size=$(( $_part1_size / 1024 / 1024 ))
+echo PART1 size: "$_part1_size"MB
+
+_sector_size=512
+# _sector_start[0] needs to be aligned to 2048
+_sector_start[0]=2048
+_sector_end[0]=$(( $_part1_size * 1024 * 1024 / $_sector_size + ${_sector_start[0]} - 1))
+_tot_size=$(( $_part1_size ))
+_npart=1
+
+if test "$DOM0_ROOTFS"
+then
+    add_partition "$DOM0_ROOTFS"
+fi
+
+i=0
+while test $i -lt $NUM_DOMUS
+do
+    if test "${DOMU_ROOTFS[$i]}"
+    then
+        add_partition "${DOMU_ROOTFS[$i]}"
+    fi
+    i=$(( $i + 1 ))
+done
+_tot_size=$(( $_tot_size + 16 ))
+
+# NOTE: Increase the size of the image to the nearest power of two
+if test "$ALIGN"
+then
+    _tot_size=$(align_size_power_of_two $_tot_size)
+fi
+
+# NOTE: Increase vos_a to 256 to accomodate rootfs
+# 528 MiB (256 + 256 + 16)
+truncate $IMG -s "$_tot_size"M
+
+if test "$GPT"
+then
+    # create GPT partition table
+    sgdisk -og $IMG
+
+    i=0
+    j=1
+    while test $i -lt $_npart
+    do
+        sgdisk -n $j:${_sector_start[$i]}:${_sector_end[$i]} -c $j:"Linux""$j" -t $j:8300 $IMG
+        i=$(( $i + 1 ))
+        j=$(( $j + 1 ))
+    done
+else
+    tmp_dos=`mktemp`
+    tmp_files+=($tmp_dos)
+
+    i=0
+    parted -s $IMG mklabel "msdos"
+    parted $IMG mkpart primary fat32 "${_sector_start[$i]}"s "${_sector_end[$i]}"s
+    parted $IMG set 1 boot on
+
+    i=1
+    j=2
+    while test $i -lt $_npart
+    do
+        parted  $IMG mkpart logical ext4 "${_sector_start[$i]}"s "${_sector_end[$i]}"s
+        i=$(( $i + 1 ))
+        j=$(( $j + 1 ))
+    done
+fi
+
+# find the first available loop device
+_loop_dev=$(losetup -f)
+
+# attach loopback device to $IMG
+losetup $_loop_dev $IMG
+
+_disksize=$(blockdev --getsize $_loop_dev)
+
+dmsetup create diskimage --table "0 $_disksize linear $_loop_dev 0"
+
+# ensure that /dev/mapper/diskimage exists
+while [ ! -b /dev/mapper/diskimage ]
+do
+    sleep 2
+done
+
+kpartx -a /dev/mapper/diskimage
+
+# ensure that /dev/mapperdiskimage1 exists
+while [ ! -b /dev/mapper/diskimage1 ]
+do
+    sleep 2
+done
+
+mkfs.vfat -F 32 -n boot /dev/mapper/diskimage1
+i=1
+j=2
+while test $i -lt $_npart
+do
+    mkfs.ext4 -L vos_$j -F /dev/mapper/diskimage$j
+    i=$(( $i + 1 ))
+    j=$(( $j + 1 ))
+done
+
+# create mount point and mount disk1
+mkdir -p ${DESTDIR}/part/disk1
+mount /dev/mapper/diskimage1 $DESTDIR/part/disk1
+
+# only copy over files that were counted for the partition size
+cd "$UBOOT_OUT"
+if [ -n "$PREPEND_PATH" ]
+then
+    mkdir -p "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+fi
+
+cp --parents "$DOM0_KERNEL" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+cp --parents "$DEVICE_TREE" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+cp --parents "$UBOOT_SCRIPT" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+
+if test "${DOM0_RAMDISK}"
+then
+    cp --parents "$DOM0_RAMDISK" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+fi
+if test "$NUM_DT_OVERLAY" && test "$NUM_DT_OVERLAY" -gt 0
+then
+    i=0
+    while test $i -lt "$NUM_DT_OVERLAY"
+    do
+        cp --parents "${DT_OVERLAY[$i]}" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+        i=$(( $i + 1 ))
+    done
+fi
+if test "${UBOOT_SOURCE}"
+then
+    cp --parents "$UBOOT_SOURCE" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+fi
+if test "${XEN}"
+then
+    cp --parents "$XEN" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+fi
+if test "$NUM_BOOT_AUX_FILE" && test "$NUM_BOOT_AUX_FILE" -gt 0
+then
+    i=0
+    while test $i -lt "$NUM_BOOT_AUX_FILE"
+    do
+        cp --parents "${BOOT_AUX_FILE[$i]}" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+        i=$(( $i + 1 ))
+    done
+fi
+if test "${BITSTREAM}"
+then
+    cp --parents "$BITSTREAM" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+fi
+
+i=0
+while test $i -lt $NUM_DOMUS
+do
+    cp --parents "${DOMU_KERNEL[$i]}" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+    if test "${DOMU_RAMDISK[$i]}"
+    then
+        cp --parents "${DOMU_RAMDISK[$i]}" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+    fi
+    if test "${DOMU_PASSTHROUGH_DTB[$i]}"
+    then
+        cp --parents "${DOMU_PASSTHROUGH_DTB[$i]}" "${DESTDIR_ABS}/part/disk1/${PREPEND_PATH}"
+    fi
+    i=$(( $i + 1 ))
+done
+cd -
+
+# unmount
+sync
+# This fails for some reason. It could work now because we are not using qemu-user
+# fstrim $DESTDIR/part/disk1
+umount $DESTDIR/part/disk1
+
+j=2
+if test "$DOM0_ROOTFS"
+then
+    write_rootfs 2 "$DOM0_ROOTFS"
+    generate_domU_configs 2
+    j=$(( $j + 1 ))
+fi
+
+i=0
+while test $i -lt $NUM_DOMUS
+do
+    if test "${DOMU_ROOTFS[$i]}"
+    then
+        write_rootfs $j "${DOMU_ROOTFS[$i]}"
+        j=$(( $j + 1 ))
+    fi
+    i=$(( $i + 1 ))
+done
+
+cleanup_disk_image
